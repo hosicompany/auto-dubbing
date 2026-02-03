@@ -20,8 +20,16 @@ import time
 
 # ============ 설정 ============
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "sk_7b0a163f718c23222429625faebe9dabf428825ebc36d6c2")
-ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"  # Lily (여성)
+ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"  # Lily (여성) - 기본 목소리
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# 사용 가능한 ElevenLabs 목소리 (화자 분리용)
+ELEVENLABS_VOICES = {
+    "male_1": "pNInz6obpgDQGcFmaJgB",    # Adam (남성)
+    "male_2": "VR6AewLTigWG4xSOukaG",    # Arnold (남성)
+    "female_1": "pFZP5JQG7iQjIQuC4Bku",  # Lily (여성)
+    "female_2": "21m00Tcm4TlvDq8ikWAM",  # Rachel (여성)
+}
 
 # Time-stretch 허용 범위
 STRETCH_TOLERANCE = 0.25
@@ -32,6 +40,89 @@ MAX_STRETCH_RATIO = 1 + STRETCH_TOLERANCE
 VAD_THRESHOLD = 0.5  # 음성 감지 임계값
 MIN_SPEECH_DURATION = 0.5  # 최소 음성 길이 (초)
 MIN_SILENCE_DURATION = 0.3  # 최소 무음 길이 (초)
+
+
+def clone_voice_elevenlabs(audio_samples: list, voice_name: str = "cloned_voice") -> str:
+    """ElevenLabs에 음성 클로닝 요청 (voice_id 반환)"""
+    print(f"[클로닝] 음성 클로닝 중: {voice_name}")
+    
+    url = "https://api.elevenlabs.io/v1/voices/add"
+    
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
+    
+    # 파일 준비
+    files = []
+    for i, sample_path in enumerate(audio_samples):
+        files.append(
+            ("files", (f"sample_{i}.mp3", open(sample_path, "rb"), "audio/mpeg"))
+        )
+    
+    data = {
+        "name": voice_name,
+        "description": f"Cloned voice for dubbing - {voice_name}"
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=data, files=files)
+        response.raise_for_status()
+        
+        result = response.json()
+        voice_id = result.get("voice_id")
+        print(f"[클로닝] 완료! Voice ID: {voice_id}")
+        return voice_id
+        
+    except Exception as e:
+        print(f"[클로닝] 실패: {e}")
+        return None
+    finally:
+        # 파일 핸들 닫기
+        for _, (_, f, _) in files:
+            f.close()
+
+
+def extract_voice_sample(audio_path: str, segments: list, output_path: str, 
+                         target_duration: float = 30.0) -> str:
+    """음성 샘플 추출 (클로닝용, 약 30초)"""
+    print(f"[샘플] 음성 샘플 추출 중 (목표: {target_duration}초)")
+    
+    # 긴 세그먼트들 선택 (품질 좋은 샘플)
+    sorted_segs = sorted(segments, key=lambda x: x['duration'], reverse=True)
+    
+    selected = []
+    total_duration = 0
+    
+    for seg in sorted_segs:
+        if total_duration >= target_duration:
+            break
+        selected.append(seg)
+        total_duration += seg['duration']
+    
+    if not selected:
+        return None
+    
+    # 선택된 세그먼트들 합치기
+    filter_parts = []
+    for i, seg in enumerate(selected):
+        filter_parts.append(f"[0:a]atrim={seg['start']}:{seg['end']},asetpts=PTS-STARTPTS[a{i}]")
+    
+    concat_inputs = "".join([f"[a{i}]" for i in range(len(selected))])
+    filter_parts.append(f"{concat_inputs}concat=n={len(selected)}:v=0:a=1[out]")
+    
+    filter_complex = ";".join(filter_parts)
+    
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-c:a", "libmp3lame", "-q:a", "2",
+        output_path
+    ]
+    
+    subprocess.run(cmd, capture_output=True, check=True)
+    print(f"[샘플] 추출 완료: {output_path} ({total_duration:.1f}초)")
+    return output_path
 
 
 def send_telegram_notification(message: str, chat_id: str, bot_token: str, 
@@ -288,9 +379,10 @@ Return ONLY the JSON array, no markdown or other text."""
     return segments
 
 
-def generate_tts(text: str, output_path: str) -> float:
+def generate_tts(text: str, output_path: str, voice_id: str = None) -> float:
     """ElevenLabs TTS 생성"""
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    vid = voice_id or ELEVENLABS_VOICE_ID
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
     
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -340,7 +432,7 @@ def time_stretch_audio(input_path: str, output_path: str, ratio: float) -> str:
     return output_path
 
 
-def process_tts_with_sync(segments: list, temp_dir: str) -> list:
+def process_tts_with_sync(segments: list, temp_dir: str, voice_id: str = None) -> list:
     """TTS 생성 + 싱크 조정"""
     print("[TTS] 음성 생성 및 싱크 조정 중...")
     
@@ -353,7 +445,7 @@ def process_tts_with_sync(segments: list, temp_dir: str) -> list:
         stretched_path = os.path.join(temp_dir, f"stretched_{i:04d}.mp3")
         
         # TTS 생성
-        tts_duration = generate_tts(seg["translated"], tts_path)
+        tts_duration = generate_tts(seg["translated"], tts_path, voice_id)
         
         # 타겟 길이
         target_duration = seg["duration"]
@@ -591,9 +683,24 @@ def process_single_video(input_path: Path, output_path: str, args) -> bool:
             print("[4/7] 번역 중...")
             segments = translate_segments(segments, args.lang, args.tone)
             
-            # 5. TTS
+            # 5. TTS (음성 클로닝 또는 선택한 목소리)
             print("[5/7] TTS 생성 중...")
-            segments = process_tts_with_sync(segments, temp_dir)
+            
+            voice_id = None
+            if hasattr(args, 'clone_voice') and args.clone_voice:
+                # 음성 클로닝
+                print("[클로닝] 원본 화자 음성 클로닝 시작...")
+                sample_path = os.path.join(temp_dir, "voice_sample.mp3")
+                extract_voice_sample(audio_mp3, speech_segments, sample_path)
+                voice_id = clone_voice_elevenlabs([sample_path], f"cloned_{input_path.stem}")
+                if not voice_id:
+                    print("[클로닝] 실패, 기본 목소리 사용")
+            elif hasattr(args, 'voice') and args.voice:
+                # 선택한 목소리
+                voice_id = ELEVENLABS_VOICES.get(args.voice)
+                print(f"[TTS] 선택한 목소리: {args.voice}")
+            
+            segments = process_tts_with_sync(segments, temp_dir, voice_id)
             
             # 6. 자막
             srt_path = os.path.join(temp_dir, "subtitle_ko.srt")
@@ -672,6 +779,9 @@ def main():
     parser.add_argument("--no-ducking", action="store_true",
                         help="자동 볼륨 조절 비활성화")
     parser.add_argument("--notify", action="store_true", help="완료 시 텔레그램 알림")
+    parser.add_argument("--clone-voice", action="store_true", help="원본 화자 음성 클로닝")
+    parser.add_argument("--voice", choices=["male_1", "male_2", "female_1", "female_2"],
+                        help="TTS 목소리 선택 (클로닝 안 할 때)")
     parser.add_argument("--telegram-chat-id", default="6329826367", help="텔레그램 Chat ID")
     parser.add_argument("--telegram-bot-token", 
                         default="8293841489:AAE6XG6x5v0Prgs0bqsVMlK9Fe_K46ESWng",

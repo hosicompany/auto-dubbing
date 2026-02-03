@@ -1,0 +1,16 @@
+# 임시 파일
+temp_dub*/
+temp_youtube/
+
+# 테스트 영상
+*.mp4
+*.srt
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# OS
+.DS_Store
+Thumbs.db
